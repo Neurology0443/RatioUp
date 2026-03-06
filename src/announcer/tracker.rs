@@ -157,6 +157,13 @@ async fn announce_http(
     client: &Client,
     event: Option<Event>,
 ) -> u64 {
+    let elapsed: u64 = if event == Some(Event::Started) {
+        0
+    } else {
+        torrent.last_announce.elapsed().as_secs()
+    };
+    let uploaded: u64 = torrent.next_upload_speed as u64 * elapsed;
+
     // announce parameters are built up in the query string, see:
     // https://www.bittorrent.org/beps/bep_0003.html trackers section
     // let mut query = vec![
@@ -268,6 +275,8 @@ async fn announce_http(
                                 warn!("Announce with warning: {:?}", std::str::from_utf8(msg));
                             } else {
                                 // good response
+                                torrent.uploaded += uploaded;
+
                                 // Interval in seconds that the client should wait between sending regular requests to the tracker
                                 if let Some(BencodeValue::Integer(interval)) =
                                     dict.get(b"interval".as_ref())
