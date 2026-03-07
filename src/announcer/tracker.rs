@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::bencode::{BencodeDecoder, BencodeValue};
 use crate::torrent::Torrent;
@@ -116,18 +116,40 @@ pub fn is_supported_url(url_str: &str) -> bool {
 pub async fn announce(torrent: &mut Torrent, event: Option<Event>) {
     // TODO: prepare announce (uploaded and downloaded if applicable)
     torrent.compute_speeds();
+    let elapsed: u64 = if event == Some(Event::Started) {
+        0
+    } else {
+        torrent.last_announce.elapsed().as_secs()
+    };
+    let uploaded_delta: u64 = torrent.next_upload_speed as u64 * elapsed;
+
     if let Some(client) = &*CLIENT.read().await {
         debug!("Torrent has {} url(s)", torrent.urls.len());
+        let mut announce_success = false;
+
         for url in torrent.urls.clone() {
             debug!("\t{}", url);
             if url.to_lowercase().starts_with("udp://") {
                 warn!("UDP tracker not supported (yet): cannot announce");
                 // interval = futures::executor::block_on(announce_udp(&url, torrent, client, event));
-                crate::announcer::udp::announce_udp(&url, torrent, client, event).await;
+                announce_success |= crate::announcer::udp::announce_udp(
+                    &url,
+                    torrent,
+                    client,
+                    event,
+                    uploaded_delta,
+                )
+                .await;
             } else {
-                announce_http(&url, torrent, client, event).await;
+                announce_success |= announce_http(&url, torrent, client, event, uploaded_delta).await;
             }
         }
+
+        if announce_success {
+            torrent.uploaded += uploaded_delta;
+            torrent.last_announce = Instant::now();
+        }
+
         info!(
             "Anounced: interval={}, event={:?}, downloaded=0, uploaded={}, seeders={}, leechers={}, torrent={}",
             torrent.interval,
@@ -156,7 +178,9 @@ async fn announce_http(
     torrent: &mut Torrent,
     client: &Client,
     event: Option<Event>,
-) -> u64 {
+    uploaded: u64,
+) -> bool {
+
     // announce parameters are built up in the query string, see:
     // https://www.bittorrent.org/beps/bep_0003.html trackers section
     // let mut query = vec![
@@ -216,7 +240,7 @@ async fn announce_http(
     let mut full_url = String::from(url);
     full_url.push(if full_url.contains('?') { '&' } else { '?' });
     full_url.push_str(&url_template);
-    let built_url = build_url(url, torrent, event, client.key.clone().to_string()).await;
+    let built_url = build_url(url, torrent, event, client.key.clone().to_string(), uploaded).await;
     info!("Announce HTTP URL {built_url}");
 
     let mut request_builder = reqwest_client.get(&built_url);
@@ -239,7 +263,7 @@ async fn announce_http(
                 Ok(b) => b,
                 Err(e) => {
                     error!("Failed to read response bytes: {:?}", e);
-                    return torrent.interval; // return current interval
+                    return false;
                 }
             };
             let bytes_vec = bytes.to_vec(); //convert Bytes to Vec<u8>
@@ -317,15 +341,13 @@ async fn announce_http(
                 }
                 Err(e) => error!("Bad response with HTTP status {status}: {:?}", e),
             }
+            true
         }
-        Err(err) => error!("Cannot announce: {:?}", err),
-    }
-    if let Some(min) = torrent.min_interval {
-        if min > torrent.interval {
-            return min;
+        Err(err) => {
+            error!("Cannot announce: {:?}", err);
+            false
         }
     }
-    torrent.interval
 }
 
 /// Build the HTTP announce URLs for the listed trackers in the torrent file.
@@ -335,15 +357,9 @@ pub async fn build_url(
     torrent: &mut Torrent,
     event: Option<Event>,
     key: String,
+    uploaded: u64,
 ) -> String {
     info!("Torrent {:?}: {}", event, torrent.name);
-    //compute downloads and uploads
-    let elapsed: u64 = if event == Some(Event::Started) {
-        0
-    } else {
-        torrent.last_announce.elapsed().as_secs()
-    };
-    let uploaded: u64 = torrent.next_upload_speed as u64 * elapsed;
 
     //build URL list
     let client = (*CLIENT.read().await).clone().unwrap();

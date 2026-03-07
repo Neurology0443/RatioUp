@@ -216,23 +216,23 @@ impl UdpTracker {
     }
 }
 
-pub async fn announce_udp(url: &str, torrent: &mut Torrent, client: &Client, event: Option<Event>) {
-    let generated_url = build_url(url, torrent, event, client.key.clone().to_string()).await;
+pub async fn announce_udp(
+    url: &str,
+    torrent: &mut Torrent,
+    client: &Client,
+    event: Option<Event>,
+    uploaded: u64,
+) -> bool {
+    let generated_url = build_url(url, torrent, event, client.key.clone().to_string(), uploaded).await;
     match generated_url.parse::<SocketAddr>() {
         Ok(tracker_addr) => {
             match UdpTracker::new(tracker_addr).await {
                 Ok(tracker) => {
-                    let elapsed: u64 = if event == Some(Event::Started) {
-                        0
-                    } else {
-                        torrent.last_announce.elapsed().as_secs()
-                    };
-                    let uploaded: u64 = torrent.next_upload_speed as u64 * elapsed;
                     let peer_id_array: [u8; 20] = match client.peer_id.as_bytes().try_into() {
                         Ok(array) => array,
                         Err(_) => {
                             error!("Wrong Peer ISD size (20 bytes)");
-                            return;
+                            return false;
                         }
                     };
                     let request = TrackerRequest {
@@ -249,18 +249,25 @@ pub async fn announce_udp(url: &str, torrent: &mut Torrent, client: &Client, eve
 
                     match tracker.announce(&request).await {
                         Ok(response) => {
-                            torrent.uploaded += uploaded;
                             torrent.min_interval = Some((response.interval as u64).max(1800));
+                            true
                         }
-                        Err(e) => error!("{:?}", e),
+                        Err(e) => {
+                            error!("{:?}", e);
+                            false
+                        }
                     }
                 }
-                Err(e) => error!("{:?}", e),
+                Err(e) => {
+                    error!("{:?}", e);
+                    false
+                }
             }
         }
         Err(e) => {
             torrent.min_interval = Some(1800);
             error!("Cannot parse URL {url} with {generated_url}: {e}");
+            false
         },
     }
 }
